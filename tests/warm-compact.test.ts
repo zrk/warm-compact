@@ -1,10 +1,12 @@
-import type { AgentInfo, On } from 'claude-code';
+import type { AgentInfo, On, SessionRateLimit } from 'claude-code';
 import { expect, mock, test, type Engine, type MockClock } from 'claude-code/testing';
 import { isHeadlessRefusal } from '../hooks/register.ts';
 import { settings } from '../hooks/text.ts';
 
 const MIN = 60_000;
+const HOUR = 60 * MIN;
 const NOW = Date.parse('2026-10-23T10:00:00Z');
+const iso = (ms: number) => new Date(ms).toISOString();
 const DESKTOP = { cwd: '/work', surface: null, isInteractive: false } as const;
 const TERMINAL = { cwd: '/work', surface: 'terminal', isInteractive: true } as const;
 const RU = { options: { language: 'ru' } };
@@ -13,6 +15,7 @@ type World = {
   tokens: number;
   agents: AgentInfo[];
   surfaces: string[];
+  rateLimits: SessionRateLimit[];
   // Set while a /compact command waits for the test to run its turn.
   release?: () => void;
   pending?: string;
@@ -24,12 +27,12 @@ function fixture(on: On, initial: Partial<World> = {}) {
   on('store.get', ($, e) => ({ value: store.get(e.key) }));
   on('store.set', ($, e) => { store.set(e.key, JSON.parse(JSON.stringify(e.value))); return { value: undefined }; });
   on('store.delete', ($, e) => { store.delete(e.key); return { value: undefined }; });
-  const world: World = { tokens: 300_000, agents: [], surfaces: ['desktop'], ...initial };
+  const world: World = { tokens: 300_000, agents: [], surfaces: ['desktop'], rateLimits: [], ...initial };
   const logs: string[] = [];
   const commands: { command: string; args?: string }[] = [];
   const direct: (string | undefined)[] = [];
   on('session.id', () => ({ value: 'test-session' }));
-  on('session.usage', () => ({ value: { startedAt: NOW, context: { tokens: world.tokens, window: 1_000_000 }, rateLimits: [] } }));
+  on('session.usage', () => ({ value: { startedAt: NOW, context: { tokens: world.tokens, window: 1_000_000 }, rateLimits: world.rateLimits } }));
   on('agent.list', () => ({ value: world.agents }));
   on('session.surfaces', () => ({ value: world.surfaces as never }));
   on('command.register', () => ({ value: { command: 'warm-compact' } }));
@@ -188,6 +191,53 @@ test('running agents skip the idle period', async ($, on) => {
   await f.clock.advance(52 * MIN);
   expect(f.commands).toEqual([]);
   expect((stored(f))[0]?.reason).toBe('agents');
+});
+
+test('a used-up limit that has not reset skips', async ($, on) => {
+  const f = fixture(on, { rateLimits: [{ kind: 'five_hour', percentUsed: 100, resetsAt: iso(NOW + 3 * HOUR) }] });
+  await $.session.start(DESKTOP);
+  await turn($, f.clock);
+  await f.clock.advance(52 * MIN);
+  expect(f.commands).toEqual([]);
+  expect(f.direct).toEqual([]);
+  const log = stored(f);
+  expect(log.length).toBe(1);
+  expect(log[0]?.outcome).toBe('skipped');
+  expect(log[0]?.reason).toBe('limited');
+  expect(f.logs.at(-1)).toContain('the five_hour usage limit is used up');
+});
+
+test('a limit that reset before the timer fired, or one short of 100, does not stop it', async ($, on) => {
+  const f = fixture(on, { rateLimits: [
+    // The last reading still says 100, but the window reset 42 minutes before the timer.
+    { kind: 'five_hour', percentUsed: 100, resetsAt: iso(NOW + 10 * MIN) },
+    { kind: 'seven_day', percentUsed: 99.9, resetsAt: iso(NOW + 72 * HOUR) },
+  ] });
+  await $.session.start(DESKTOP);
+  await turn($, f.clock);
+  await f.clock.advance(52 * MIN);
+  expect(f.commands.length).toBe(1);
+  await compactTurn($, f);
+  expect(stored(f)[0]?.outcome).toBe('compacted');
+});
+
+test('a used-up window with no reset time skips too', async ($, on) => {
+  const f = fixture(on, { rateLimits: [{ kind: 'seven_day', percentUsed: 100 }] });
+  await $.session.start(DESKTOP);
+  await turn($, f.clock);
+  await f.clock.advance(52 * MIN);
+  expect(f.commands).toEqual([]);
+  expect(stored(f)[0]?.reason).toBe('limited');
+});
+
+test('now skips while the limit is used up', async ($, on) => {
+  const f = fixture(on, { rateLimits: [{ kind: 'five_hour', percentUsed: 100, resetsAt: iso(NOW + 3 * HOUR) }] });
+  await $.session.start(DESKTOP);
+  await turn($, f.clock);
+  await command($, 'now');
+  await f.clock.advance(1000);
+  expect(f.commands.filter(c => c.command === 'compact')).toEqual([]);
+  expect(stored(f)[0]?.reason).toBe('limited');
 });
 
 test('off stops this session, on arms it again', async ($, on) => {

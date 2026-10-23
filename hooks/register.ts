@@ -1,4 +1,4 @@
-import type { EngineInterface, Register, SessionCompactResult, Timer } from 'claude-code';
+import type { EngineInterface, Register, SessionCompactResult, SessionRateLimit, Timer } from 'claude-code';
 import { cachePercent, clockTime, instructions, settings, t, tokens, type Config, type MessageKey } from './text.ts';
 
 // A one-hour prompt cache lapses an hour after the last request that read or
@@ -128,6 +128,12 @@ export function isHeadlessRefusal(err: unknown) {
   return /headless|SDK session/i.test(String((err as Error)?.message ?? err));
 }
 
+/** A rate-limit window that is used up and not known to have reset: until it does, requests are refused or billed as extra usage. */
+export function usedUp(limits: readonly SessionRateLimit[], now: number): SessionRateLimit | undefined {
+  // The reading is the last API response's: past its reset time the window is fresh again.
+  return (limits ?? []).find(w => w.percentUsed >= 100 && !(Date.parse(w.resetsAt ?? '') <= now));
+}
+
 /** Why the attempt should not compact any more: the cache went cold while it waited. */
 function lateReason(c: Compacting, now: number): string | undefined {
   return !c.manual && now - c.since > cfg.cutoffMs ? 'late: the cache went cold while waiting' : undefined;
@@ -149,10 +155,16 @@ async function fire($: EngineInterface, token: number, sessionId: string, since:
     await skip('late', say('skipLate', { idle: base.idleMinutes }));
     return;
   }
-  const { context } = await $.session.usage();
+  const { context, rateLimits } = await $.session.usage();
   const size = context.tokens;
   if (!manual && (size ?? 0) < cfg.minTokens) {
     await skip('small', say('skipSmall', { tokens: tokens(size), min: tokens(cfg.minTokens) }), size);
+    return;
+  }
+  // By hand or not: the summary request would be refused until the reset, or billed as extra usage.
+  const limit = usedUp(rateLimits, start);
+  if (limit) {
+    await skip('limited', say('skipLimited', { kind: limit.kind }), size);
     return;
   }
   if (!manual) {

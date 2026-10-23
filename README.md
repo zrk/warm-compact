@@ -39,6 +39,10 @@ the mod on their own; in a session that is already open, send
 - **Cold cache is skipped.** If the timer fires later than `cutoffMinutes`
   after the last request (for example the computer was asleep), the cache is
   already cold and the mod does nothing.
+- **A used-up limit is skipped.** While a usage-limit window stands at 100%
+  and has not reset, the mod does not compact, by hand or not: the summary
+  request would be refused until the reset, or billed as extra usage if that
+  is on. A session that waits for the reset is left as it is.
 - **Subagents.** While subagents run, the mod skips.
 - **Cancelling.** Any new turn, `/clear`, or a compaction done by someone else
   cancels the timer.
@@ -62,7 +66,7 @@ work, what was not verified, and dates. Your `noteHint` is added to the end.
 | Command | Effect |
 | --- | --- |
 | `/warm-compact status` | Version, session and state |
-| `/warm-compact now` | Compact at once, ignoring idle time and size; refused while a turn runs |
+| `/warm-compact now` | Compact at once, ignoring idle time and size; refused while a turn runs, skipped while the usage limit is used up |
 | `/warm-compact off` | Turn the mod off in this session |
 | `/warm-compact on` | Turn it back on in this session |
 
