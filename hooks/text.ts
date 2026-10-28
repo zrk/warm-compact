@@ -72,6 +72,13 @@ const MESSAGES = {
     outcomeNoted: 'noted',
     instructions: 'This compaction ran automatically at {time}, after {idle} minutes without a model request, before the one-hour prompt cache expired. Open the summary by saying so. Write it as a note for continuing the work: the goal; what is done; what is left and the next step; files touched; decisions and permissions the user gave, with their reasons; rejected options, briefly, and why they were rejected; the exact paths, file names, commands, commits, identifiers and numbers needed to continue and verify the work, not rounded or paraphrased, leaving out intermediate and repeated ones; background processes, agents and waits still open; what was not verified; dates and deadlines.',
     instructionsManual: 'This compaction was started by hand with /warm-compact now at {time}. Open the summary by saying so. Write it as a note for continuing the work: the goal; what is done; what is left and the next step; files touched; decisions and permissions the user gave, with their reasons; rejected options, briefly, and why they were rejected; the exact paths, file names, commands, commits, identifiers and numbers needed to continue and verify the work, not rounded or paraphrased, leaving out intermediate and repeated ones; background processes, agents and waits still open; what was not verified; dates and deadlines.',
+    openQuestion: 'The last turn ended on a question to the user, or several, never answered: the cards were removed for this compaction. Quote each word for word as an open question, with its header, every option with its description, and whether several answers are allowed; the user\'s next message may answer it: {question}',
+    oneAnswer: 'one answer',
+    manyAnswers: 'several answers allowed',
+    optionsWord: 'options',
+    cardNotice: 'warm-compact: a question card waits for an answer; if it is not answered by {time}, it is removed and the session compacted while the cache is warm.',
+    cardRemoved: 'warm-compact: the question waited {idle} min without an answer; the card was removed to compact the session while the cache is warm. Answer it in a message: {question}',
+    cardPending: 'Waiting on a question card: removed at {time} if unanswered, then compacted.',
   },
   ru: {
     commandDescription: 'Сжимать сессию в простое до протухания кэша: status, now, off, on',
@@ -107,6 +114,13 @@ const MESSAGES = {
     outcomeNoted: 'отмечено',
     instructions: 'Это сжатие запущено автоматически в {time}, после {idle} минут без запросов к модели, до протухания часового промт-кэша. Начни резюме с этого. Пиши её как записку для продолжения работы: цель; что сделано; что осталось и следующий шаг; тронутые файлы; решения и разрешения пользователя с причинами; отвергнутые варианты, коротко, и почему от них отказались; точные пути, имена файлов, команды, коммиты, идентификаторы и числа, нужные для продолжения и проверки, без округления и пересказа, а промежуточные и повторы опускай; незавершённые фоновые процессы, агенты и ожидания; что не проверено; даты и сроки.',
     instructionsManual: 'Это сжатие запущено вручную командой /warm-compact now в {time}. Начни резюме с этого. Пиши её как записку для продолжения работы: цель; что сделано; что осталось и следующий шаг; тронутые файлы; решения и разрешения пользователя с причинами; отвергнутые варианты, коротко, и почему от них отказались; точные пути, имена файлов, команды, коммиты, идентификаторы и числа, нужные для продолжения и проверки, без округления и пересказа, а промежуточные и повторы опускай; незавершённые фоновые процессы, агенты и ожидания; что не проверено; даты и сроки.',
+    openQuestion: 'Последний ход закончился вопросом пользователю (или несколькими), на который так и не ответили: карточки сняли ради этого сжатия. Приведи каждый дословно как открытый вопрос, с заголовком, всеми вариантами и их описаниями и пометкой, можно ли выбрать несколько; следующее сообщение пользователя может быть ответом на него: {question}',
+    oneAnswer: 'один ответ',
+    manyAnswers: 'можно несколько ответов',
+    optionsWord: 'варианты',
+    cardNotice: 'warm-compact: карточка с вопросом ждёт ответа; если не ответить до {time}, она будет снята, а сессия сжата, пока кэш тёплый.',
+    cardRemoved: 'warm-compact: вопрос ждал ответа {idle} мин; карточка снята, чтобы сжать сессию, пока кэш тёплый. Ответьте на него сообщением: {question}',
+    cardPending: 'Ждёт ответа на карточку с вопросом: без ответа она будет снята в {time}, затем сессия сжата.',
   },
 } as const;
 
@@ -132,7 +146,61 @@ export function cachePercent(usage: ModelUsage | undefined): number | undefined 
   return input ? Math.floor((usage.cache_read_input_tokens * 100) / input) : undefined;
 }
 
-export function instructions(cfg: Config, time: string, idleMinutes: number, manual: boolean): string {
-  const base = t(cfg, manual ? 'instructionsManual' : 'instructions', { time, idle: idleMinutes });
-  return cfg.hint ? `${base} ${cfg.hint}` : base;
+/** The note to the summarizer; `question`: the questions of the cards removed for it, never answered. */
+export function instructions(cfg: Config, time: string, idleMinutes: number, manual: boolean, question?: string): string {
+  const parts = [t(cfg, manual ? 'instructionsManual' : 'instructions', { time, idle: idleMinutes })];
+  if (question !== undefined) parts.push(t(cfg, 'openQuestion', { question }));
+  if (cfg.hint) parts.push(cfg.hint);
+  return parts.join(' ');
+}
+
+// The questions go into a line in the session, short, and into the note in full: a long text is cut.
+const LINE_MAX = 1500;
+const NOTE_MAX = 4000;
+
+type Asked = { question?: unknown; header?: unknown; multiSelect?: unknown; options?: unknown };
+type Option = { label?: unknown; description?: unknown };
+
+function oneLine(s: unknown): string {
+  return typeof s === 'string' ? s.replace(/\s+/g, ' ').trim() : '';
+}
+
+function asked(questions: readonly unknown[]): Asked[] {
+  return questions.filter((q): q is Asked => typeof q === 'object' && q !== null);
+}
+
+function options(q: Asked): Option[] {
+  return Array.isArray(q.options) ? q.options.filter((o): o is Option => typeof o === 'object' && o !== null) : [];
+}
+
+function cut(text: string, max: number): string {
+  // Not cut inside a character outside the BMP (an emoji): half of it would not encode.
+  return text.length > max ? `${text.slice(0, max - 1).replace(/[\uD800-\uDBFF]$/, '').trimEnd()}…` : text;
+}
+
+/** The cards' questions for the session line: each with its option labels, `"Which one?" (A / B)`. */
+export function questionLine(questions: readonly unknown[]): string {
+  const text = asked(questions)
+    .map(q => {
+      const labels = options(q).map(o => oneLine(o.label)).filter(Boolean);
+      return labels.length ? `"${oneLine(q.question)}" (${labels.join(' / ')})` : `"${oneLine(q.question)}"`;
+    })
+    .join('; ');
+  return cut(text, LINE_MAX);
+}
+
+/** The cards' questions for the summarizer, whole: header, question, one or several answers, each option with its description. */
+export function questionNote(cfg: Config, questions: readonly unknown[]): string {
+  const text = asked(questions)
+    .map(q => {
+      const header = oneLine(q.header);
+      const answers = t(cfg, q.multiSelect === true ? 'manyAnswers' : 'oneAnswer');
+      const list = options(q).map(o => {
+        const description = oneLine(o.description);
+        return description ? `"${oneLine(o.label)}" — ${description}` : `"${oneLine(o.label)}"`;
+      });
+      return `${header ? `${header}: ` : ''}"${oneLine(q.question)}" (${answers}), ${t(cfg, 'optionsWord')}: ${list.join('; ')}.`;
+    })
+    .join(' ');
+  return cut(text, NOTE_MAX);
 }

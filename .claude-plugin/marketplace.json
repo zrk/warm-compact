@@ -11,7 +11,7 @@
       "name": "warm-compact",
       "source": "./",
       "description": "Compact a large idle session while its one-hour prompt cache is still warm",
-      "version": "0.2.4"
+      "version": "0.2.5"
     }
   ]
 }
