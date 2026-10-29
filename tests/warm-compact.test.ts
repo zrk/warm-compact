@@ -741,6 +741,50 @@ test('a turn that starts while the joining client is read is armed by its own en
   await compactTurn($, f);
 });
 
+// A plugin around the clock: with a count in `hold-reads`, that many reads of the time
+// wait on one shared minute of the test's clock, so the hooks parked in them resume in
+// one batch, as two reads of the time settling in one tick of the engine would.
+const HOLD_READS_TOGETHER: Plugin = {
+  name: 'hold-reads-together',
+  register(on) {
+    let gate: Promise<void> | undefined;
+    on('clock.now', async ($, e, next) => {
+      const n = await $.store.get('hold-reads');
+      if (typeof n === 'number' && n > 0) {
+        await $.store.set('hold-reads', n - 1);
+        gate ??= $.clock.sleep(60_000);
+        await gate;
+      }
+      return next(e);
+    });
+  },
+};
+
+test('two clients joining together, their reads settling in one tick, keep the card watched', { plugins: [HOLD_READS_TOGETHER] }, async ($, on) => {
+  const f = fixture(on, { surfaces: [] });
+  await $.session.start(DESKTOP);
+  const { turnId, call } = await askInTurn($, f);
+  await f.clock.advance(20 * MIN);
+  // Both joins watch the same card and read the time last: both reads come back together.
+  f.store.set('hold-reads', 2);
+  const first = $.session.attach(JOIN);
+  const second = $.session.attach({ surface: 'desktop', clientId: 'desktop:second' });
+  await f.clock.settle();
+  expect(f.logs).toEqual([]);
+  await f.clock.advance(MIN);
+  await first;
+  await second;
+  expect(f.logs.filter(l => l.includes('waits for an answer'))).toEqual([watching(NOW + 52 * MIN)]);
+  // The card is still watched: removed 52 minutes after the request that put it up.
+  await f.clock.advance(31 * MIN);
+  expect(f.aborts).toEqual([turnId]);
+  expect(await call).toEqual(ABORTED);
+  await ended($, turnId, 'aborted');
+  await f.clock.settle();
+  expect(f.commands.length).toBe(1);
+  await compactTurn($, f);
+});
+
 // A reload in the middle of a turn: the module never saw the turn start, and takes the main loop for idle.
 test('a client joining a session already drawn arms nothing: after a reload mid-turn, the turn end arms', async ($, on) => {
   const f = fixture(on, { surfaces: [], state: { drawn: { sessionId: 'test-session' } } });
@@ -752,6 +796,50 @@ test('a client joining a session already drawn arms nothing: after a reload mid-
   // Its end arms the timer, already due.
   await $.turn.complete({ turnId: 'running', answer: 'ok', durationMs: 1, isAborted: false, reason: 'answer' });
   await f.clock.settle();
+  expect(f.commands.length).toBe(1);
+  await compactTurn($, f);
+  expect(stored(f).map(e => [e.outcome, e.reason])).toEqual([['compacted', 'idle']]);
+});
+
+// Never drawn, the session has no mark in the state: the join marks it drawn and catches up.
+test('a client joining a session never drawn arms nothing after a reload mid-turn: the turn runs on', async ($, on) => {
+  const f = fixture(on, { surfaces: [] });
+  await $.session.start(DESKTOP);
+  for await (const _ of $.turn.step({ turnId: 'running', index: 1, model: 'test', messageCount: 3 })) { /* drain */ }
+  await $.session.attach(JOIN);
+  await f.clock.advance(52 * MIN);
+  // No timer kept in the state, no /compact queued under the turn.
+  expect(f.state.get('armed') ?? null).toBeNull();
+  expect(f.commands).toEqual([]);
+});
+
+test('a card up when a client joins a session never drawn after a reload mid-turn: no compaction is queued under it', async ($, on) => {
+  const f = fixture(on, { surfaces: [] });
+  await $.session.start(DESKTOP);
+  for await (const _ of $.turn.step({ turnId: 'running', index: 1, model: 'test', messageCount: 3 })) { /* drain */ }
+  const call = ask($, [QUESTION]);
+  await f.clock.settle();
+  await $.session.attach(JOIN);
+  await f.clock.advance(52 * MIN);
+  expect(f.commands).toEqual([]);
+  expect(f.open.size).toBe(1);
+  answer(f, ANSWERED);
+  expect(await call).toEqual(ANSWERED);
+});
+
+test('a turn begun before a reload, ended while hidden: a client joining later arms the timer for the time left', async ($, on) => {
+  const f = fixture(on, { surfaces: [] });
+  await $.session.start(DESKTOP);
+  for await (const _ of $.turn.step({ turnId: 'running', index: 1, model: 'test', messageCount: 3 })) { /* drain */ }
+  await f.clock.advance(2 * MIN);
+  // Its end is seen, though its start was not: the main loop is idle from here.
+  await $.turn.complete({ turnId: 'running', answer: 'ok', durationMs: 1, isAborted: false, reason: 'answer' });
+  await f.clock.advance(10 * MIN);
+  await $.session.attach(JOIN);
+  // Due 52 minutes after the turn's last request.
+  await f.clock.advance(40 * MIN - 1);
+  expect(f.commands).toEqual([]);
+  await f.clock.advance(1);
   expect(f.commands.length).toBe(1);
   await compactTurn($, f);
   expect(stored(f).map(e => [e.outcome, e.reason])).toEqual([['compacted', 'idle']]);
