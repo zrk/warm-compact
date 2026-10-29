@@ -176,16 +176,21 @@ both may run. If you want only this mod, set `"idleCompaction": false`.
   perfect: details not written into the note may be lost, as with any
   compaction.
 - A session is compacted only after some surface has shown it once: a run
-  that never drew is taken for a headless one. A hidden session keeps the
-  mark through a plugin reload, but not through a restart of the app; it
-  is compacted again once you open it.
+  that never drew is taken for a headless one. Opening it at any moment
+  counts, and what was left while it was hidden catches up then: the timer
+  for the time left, the watch on an open card. Opened after `idleMinutes`
+  but before `cutoffMinutes`, it is compacted at once. A hidden session
+  keeps the mark through a plugin reload, but not through a restart of the
+  app or a new conversation in it; it is compacted again once you open it.
+  A plugin reload forgets the last request of a session never shown: opened
+  after the reload, it is compacted only after its next turn.
 - Only a question card of the main loop is removed, not one a subagent asks.
   A plugin reload while a card is open drops its watch: that card waits for
   your answer, as it did before 0.2.5.
 
 ## Development
 
-Tested on Claude Code 2.1.308.
+Tested on Claude Code 2.1.308, 2.1.309 and 2.1.312.
 
 ```
 claude plugin validate --strict .

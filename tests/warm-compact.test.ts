@@ -31,7 +31,7 @@ type World = {
   sessionId?: string;
   // The next read of each is held up this long: the computer slept, or something
   // happened meanwhile; what is read after it comes that much later.
-  lag?: { 'session.id'?: number; 'agent.list'?: number };
+  lag?: { 'session.id'?: number; 'agent.list'?: number; 'session.usage'?: number; 'state.set'?: number };
 };
 
 function fixture(on: On, initial: Partial<World> = {}) {
@@ -46,9 +46,13 @@ function fixture(on: On, initial: Partial<World> = {}) {
   const state = new Map<string, unknown>();
   on('state.get', ($, e, next) => (seeded.has(e.key) ? { value: { value: seeded.get(e.key), version: 1 } } : next(e)) as never);
   on('state.set', ($, e, next) => {
-    seeded.delete(e.key);
-    state.set(e.key, JSON.parse(JSON.stringify(e.value)));
-    return next(e);
+    const write = () => {
+      seeded.delete(e.key);
+      state.set(e.key, JSON.parse(JSON.stringify(e.value)));
+      return next(e);
+    };
+    // A write held up by `lag` lands that much later; any other at once.
+    return (world.lag?.['state.set'] ? held('state.set').then(write) : write()) as never;
   });
   const world: World = { tokens: 300_000, agents: [], surfaces: ['desktop'], rateLimits: [], ...initial };
   const aborts: string[] = [];
@@ -66,7 +70,7 @@ function fixture(on: On, initial: Partial<World> = {}) {
     }
     return { value: undefined };
   });
-  const held = async (op: 'session.id' | 'agent.list') => {
+  const held = async (op: 'session.id' | 'agent.list' | 'session.usage' | 'state.set') => {
     const ms = world.lag?.[op];
     if (!ms) return;
     world.lag = { ...world.lag, [op]: undefined };
@@ -88,7 +92,10 @@ function fixture(on: On, initial: Partial<World> = {}) {
     await held('session.id');
     return { value: world.sessionId ?? 'test-session' };
   });
-  on('session.usage', () => ({ value: { startedAt: NOW, context: { tokens: world.tokens, window: 1_000_000 }, rateLimits: world.rateLimits } }));
+  on('session.usage', async () => {
+    await held('session.usage');
+    return { value: { startedAt: NOW, context: { tokens: world.tokens, window: 1_000_000 }, rateLimits: world.rateLimits } };
+  });
   on('agent.list', async () => {
     await held('agent.list');
     return { value: world.agents };
@@ -98,6 +105,7 @@ function fixture(on: On, initial: Partial<World> = {}) {
   on('ui.log', ($, e) => { logs.push(e.text); return { value: undefined }; });
   on('session.start', ($, e) => ({ cwd: e.cwd }));
   on('session.end', ($, e) => ({ sessionId: e.sessionId }));
+  on('session.attach', ($, e) => ({ clientId: e.clientId }));
   on('turn.start', ($, e) => ({ turnId: e.turnId }));
   on('turn.complete', () => ({ text: '' }));
   on('turn.step', async function* ($, e) { return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: null }; });
@@ -535,6 +543,220 @@ test('a mark of another session does not make a headless run drawn', async ($, o
   expect(stored(f)).toEqual([]);
 });
 
+// The desktop app lists a client only while it shows the session: one shown only
+// between a start, a turn's end and a card is seen drawn by the client joining.
+const JOIN = { surface: 'desktop', clientId: 'desktop:default' } as const;
+
+test('a client joining a session hidden at its turn end arms the timer for the time left', async ($, on) => {
+  const f = fixture(on, { surfaces: [] });
+  await $.session.start(DESKTOP);
+  await turn($, f.clock);
+  await f.clock.advance(10 * MIN);
+  await $.session.attach(JOIN);
+  expect(f.state.get('drawn')).toEqual({ sessionId: 'test-session' });
+  await f.clock.advance(42 * MIN - 1);
+  expect(f.commands).toEqual([]);
+  await f.clock.advance(1);
+  expect(f.commands.length).toBe(1);
+  await compactTurn($, f);
+  expect(stored(f).map(e => [e.outcome, e.reason])).toEqual([['compacted', 'idle']]);
+});
+
+test('a client joining past the cutoff leaves the cold session alone', async ($, on) => {
+  const f = fixture(on, { surfaces: [] });
+  await $.session.start(DESKTOP);
+  await turn($, f.clock);
+  await f.clock.advance(58 * MIN);
+  await $.session.attach(JOIN);
+  await f.clock.advance(2 * HOUR);
+  expect(f.commands).toEqual([]);
+  expect(stored(f)).toEqual([]);
+  expect(f.logs).toEqual([]);
+});
+
+test('a card that went up while the session was hidden is watched when a client joins', async ($, on) => {
+  const f = fixture(on, { surfaces: [] });
+  await $.session.start(DESKTOP);
+  const { turnId, call } = await askInTurn($, f);
+  expect(f.logs).toEqual([]);
+  await f.clock.advance(20 * MIN);
+  await $.session.attach(JOIN);
+  // Due 52 minutes after the request that put the card up, as had the session been drawn then.
+  expect(f.logs).toEqual([watching(NOW + 52 * MIN)]);
+  await f.clock.advance(32 * MIN - 1);
+  expect(f.aborts).toEqual([]);
+  await f.clock.advance(1);
+  expect(f.aborts).toEqual([turnId]);
+  expect(await call).toEqual(ABORTED);
+  await ended($, turnId, 'aborted');
+  await f.clock.settle();
+  expect(f.commands.length).toBe(1);
+  await compactTurn($, f);
+  expect(f.compactions[0]).toContain(`the user's next message may answer it: ${FULL}`);
+  expect(stored(f).map(e => [e.outcome, e.reason])).toEqual([['compacted', 'idle']]);
+});
+
+test('a card answered while the joining client is read is not watched: no line, nothing removed', async ($, on) => {
+  const f = fixture(on, { surfaces: [] });
+  await $.session.start(DESKTOP);
+  const { turnId, call } = await askInTurn($, f);
+  await f.clock.advance(20 * MIN);
+  // The watch reads the usage late: the person answers the card meanwhile.
+  f.world.lag = { 'session.usage': MIN };
+  const joined = $.session.attach(JOIN);
+  await f.clock.settle();
+  answer(f, ANSWERED);
+  expect(await call).toEqual(ANSWERED);
+  await f.clock.advance(MIN);
+  await joined;
+  // No line names a removal time for a card already answered.
+  expect(f.logs).toEqual([]);
+  // The model works on past the card's time: nothing is left to remove.
+  for await (const _ of $.turn.step({ turnId, index: 1, model: 'test', messageCount: 3 })) { /* drain */ }
+  await f.clock.advance(40 * MIN);
+  expect(f.aborts).toEqual([]);
+});
+
+test('a card answered while the joining client is read leaves the watch to the next card', async ($, on) => {
+  const f = fixture(on, { surfaces: [] });
+  await $.session.start(DESKTOP);
+  const { turnId, call } = await askInTurn($, f);
+  await f.clock.advance(20 * MIN);
+  // The watch reads the usage late: meanwhile the person answers, and the model asks again at once.
+  f.world.lag = { 'session.usage': MIN };
+  const joined = $.session.attach(JOIN);
+  await f.clock.settle();
+  answer(f, ANSWERED);
+  expect(await call).toEqual(ANSWERED);
+  for await (const _ of $.turn.step({ turnId, index: 1, model: 'test', messageCount: 3 })) { /* drain */ }
+  const next = ask($, [SHIP]);
+  await f.clock.settle();
+  await f.clock.advance(MIN);
+  await joined;
+  // The next card is removed 52 minutes after the request that put it up.
+  await f.clock.advance(51 * MIN - 1);
+  expect(f.aborts).toEqual([]);
+  await f.clock.advance(1);
+  expect(f.aborts).toEqual([turnId]);
+  expect(await next).toEqual(ABORTED);
+  expect(f.logs.filter(l => l.includes('waits for an answer'))).toEqual([watching(NOW + 72 * MIN)]);
+});
+
+test('a card left unwatched is watched when its client joins, though another card saw the session drawn first', async ($, on) => {
+  const f = fixture(on, { surfaces: [] });
+  await $.session.start(DESKTOP);
+  const turnId = await requestInTurn($);
+  const first = ask($, [QUESTION]);
+  await f.clock.settle();
+  // The roster lists the client before its join is raised: the second card of the answer reads it first.
+  f.world.surfaces = ['desktop'];
+  const second = ask($, [SHIP]);
+  await f.clock.settle();
+  await $.session.attach(JOIN);
+  await f.clock.advance(52 * MIN);
+  // One removal ends the turn, and both cards with it.
+  expect(f.aborts).toEqual([turnId]);
+  expect(await first).toEqual(ABORTED);
+  expect(await second).toEqual(ABORTED);
+});
+
+test('a client joining after the idle time, before the cutoff, compacts at once', async ($, on) => {
+  const f = fixture(on, { surfaces: [] });
+  await $.session.start(DESKTOP);
+  await turn($, f.clock);
+  await f.clock.advance(55 * MIN);
+  await $.session.attach(JOIN);
+  await f.clock.settle();
+  expect(f.commands.length).toBe(1);
+  await compactTurn($, f);
+  expect(stored(f).map(e => [e.outcome, e.reason])).toEqual([['compacted', 'idle']]);
+});
+
+test('a client joining before /warm-compact now fires keeps the compaction it promised', async ($, on) => {
+  const f = fixture(on, { surfaces: [] });
+  await $.session.start(DESKTOP);
+  await turn($, f.clock);
+  await f.clock.advance(5 * MIN);
+  await command($, 'now');
+  await $.session.attach(JOIN);
+  await f.clock.advance(1000);
+  expect(f.commands.length).toBe(1);
+  await compactTurn($, f);
+  expect(stored(f).map(e => [e.outcome, e.reason])).toEqual([['compacted', 'manual']]);
+});
+
+test('a client joining as /warm-compact now begins to compact does not cancel it', async ($, on) => {
+  const f = fixture(on, { surfaces: [] });
+  await $.session.start(DESKTOP);
+  await turn($, f.clock);
+  await f.clock.advance(5 * MIN);
+  await command($, 'now');
+  // The compaction has begun and clears the state; the client joins while that write is under way.
+  f.world.lag = { 'state.set': MIN };
+  await f.clock.advance(1000);
+  await $.session.attach(JOIN);
+  await f.clock.advance(MIN);
+  expect(f.commands.length).toBe(1);
+  await compactTurn($, f);
+  expect(stored(f).map(e => [e.outcome, e.reason])).toEqual([['compacted', 'manual']]);
+});
+
+// A plugin around the clock: with `hold-read` in the store, the next read of the time
+// waits a minute of the test's clock, as a hook that awaits the clock while the session moves on.
+const HOLD_READ: Plugin = {
+  name: 'hold-read',
+  register(on) {
+    on('clock.now', async ($, e, next) => {
+      if ((await $.store.get('hold-read')) === true) {
+        await $.store.delete('hold-read');
+        await $.clock.sleep(60_000);
+      }
+      return next(e);
+    });
+  },
+};
+
+test('a turn that starts while the joining client is read is armed by its own end alone', { plugins: [HOLD_READ] }, async ($, on) => {
+  const f = fixture(on, { surfaces: [] });
+  await $.session.start(DESKTOP);
+  await turn($, f.clock);
+  await f.clock.advance(10 * MIN);
+  // The catch-up finds the main loop idle and reads the clock; the turn starts meanwhile.
+  f.store.set('hold-read', true);
+  const joined = $.session.attach(JOIN);
+  await f.clock.settle();
+  expect(f.store.has('hold-read')).toBe(false);
+  await $.turn.start({ turnId: 'joined', text: 'hello' });
+  await f.clock.advance(MIN);
+  await joined;
+  // Nothing is armed while the turn runs: no timer kept in the state, none fires.
+  expect(f.state.get('armed')).toBeNull();
+  await f.clock.advance(42 * MIN);
+  expect(stored(f)).toEqual([]);
+  // Its end arms as any turn's.
+  for await (const _ of $.turn.step({ turnId: 'joined', index: 0, model: 'test', messageCount: 1 })) { /* drain */ }
+  await $.turn.complete({ turnId: 'joined', answer: 'ok', durationMs: 1, isAborted: false, reason: 'answer' });
+  await f.clock.advance(52 * MIN);
+  expect(f.commands.length).toBe(1);
+  await compactTurn($, f);
+});
+
+// A reload in the middle of a turn: the module never saw the turn start, and takes the main loop for idle.
+test('a client joining a session already drawn arms nothing: after a reload mid-turn, the turn end arms', async ($, on) => {
+  const f = fixture(on, { surfaces: [], state: { drawn: { sessionId: 'test-session' } } });
+  await $.session.start(DESKTOP);
+  for await (const _ of $.turn.step({ turnId: 'running', index: 1, model: 'test', messageCount: 3 })) { /* drain */ }
+  await $.session.attach(JOIN);
+  await f.clock.advance(52 * MIN);
+  expect(f.commands).toEqual([]);
+  // Its end arms the timer, already due.
+  await $.turn.complete({ turnId: 'running', answer: 'ok', durationMs: 1, isAborted: false, reason: 'answer' });
+  await f.clock.settle();
+  expect(f.commands.length).toBe(1);
+  await compactTurn($, f);
+  expect(stored(f).map(e => [e.outcome, e.reason])).toEqual([['compacted', 'idle']]);
+});
+
 test('status and now answer in Russian when configured', RU, async ($, on) => {
   const f = fixture(on);
   await $.session.start(DESKTOP);
@@ -889,6 +1111,21 @@ test('a card that goes up 53 minutes after its request is not watched: removed i
   await passedThrough(f, call);
 });
 
+test('a card that goes up as someone else compacts is not watched: its removal would compact nothing', async ($, on) => {
+  const f = fixture(on);
+  await $.session.start(DESKTOP);
+  await requestInTurn($);
+  // The watch reads the usage late; another plugin compacts the conversation meanwhile, and it stays large.
+  f.world.lag = { 'session.usage': MIN };
+  const call = ask($);
+  await f.clock.settle();
+  await $.session.compact({ trigger: 'manual', messages: SUMMARY });
+  f.world.tokens = 300_000;
+  await f.clock.advance(MIN);
+  await f.clock.advance(120 * MIN);
+  await passedThrough(f, call);
+});
+
 test('a card whose timer fires after the computer slept is left up: the cache is cold', async ($, on) => {
   const f = fixture(on);
   await $.session.start(DESKTOP);
@@ -930,10 +1167,12 @@ test('with the cutoff a minute after the idle time, a card that goes up at once 
 test('a card with agents still running is left up, and noted', async ($, on) => {
   const f = fixture(on, { agents: [{ id: 'a1', description: 'scan', type: 'Explore', status: 'running' } as AgentInfo] });
   await $.session.start(DESKTOP);
-  await askInTurn($, f);
+  const { call } = await askInTurn($, f);
   await f.clock.advance(120 * MIN);
   expect(f.aborts).toEqual([]);
   expect(stored(f).map(e => [e.outcome, e.reason])).toEqual([['noted', 'card: 1 agent(s) still running']]);
+  answer(f, ANSWERED);
+  expect(await call).toEqual(ANSWERED);
 });
 
 test('another tool of the turn still running keeps the card: ending the turn would stop it too', async ($, on) => {
@@ -954,14 +1193,31 @@ test('another tool of the turn still running keeps the card: ending the turn wou
   await tool;
 });
 
+test('a tool of the turn that ended before the card does not keep it', async ($, on) => {
+  const f = fixture(on);
+  await $.session.start(DESKTOP);
+  const turnId = await requestInTurn($);
+  const tool = $.tool.call({ tool: 'Bash', command: 'ls' });
+  await f.clock.settle();
+  answer(f, { result: 'done', text: 'done' }, 'Bash');
+  await tool;
+  const call = ask($);
+  await f.clock.settle();
+  await f.clock.advance(52 * MIN);
+  expect(f.aborts).toEqual([turnId]);
+  expect(await call).toEqual(ABORTED);
+});
+
 test('a usage limit used up by the removal time keeps the card, and is noted', async ($, on) => {
   const f = fixture(on);
   await $.session.start(DESKTOP);
-  await askInTurn($, f);
+  const { call } = await askInTurn($, f);
   f.world.rateLimits = [{ kind: 'five_hour', percentUsed: 100, resetsAt: iso(NOW + 3 * HOUR) }];
   await f.clock.advance(52 * MIN);
   expect(f.aborts).toEqual([]);
   expect(stored(f).map(e => [e.outcome, e.reason])).toEqual([['noted', 'card: the five_hour usage limit is used up']]);
+  answer(f, ANSWERED);
+  expect(await call).toEqual(ANSWERED);
 });
 
 test('a limit that reset before the removal time, or one short of 100, does not keep the card', async ($, on) => {
@@ -996,11 +1252,13 @@ test('off leaves a card up, whether turned off before it went up or while it wai
   await passedThrough(f, first.call);
   await ended($, first.turnId, 'answer');
   await command($, 'on');
-  await askInTurn($, f);
+  const second = await askInTurn($, f);
   expect(f.logs).toEqual([watching(f.clock.now() + 52 * MIN)]);
   await command($, 'off');
   await f.clock.advance(120 * MIN);
   expect(f.aborts).toEqual([]);
+  answer(f, ANSWERED);
+  expect(await second.call).toEqual(ANSWERED);
 });
 
 test('off while the removal reads keeps the card', async ($, on) => {
