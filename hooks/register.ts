@@ -7,7 +7,7 @@ import { cachePercent, clockTime, instructions, questionLine, questionNote, sett
 // mod compacts it while the cache is still warm, so the summary reads the
 // conversation at the cache price and the next return starts small.
 
-const VERSION = '0.2.5';
+const VERSION = '0.2.6-dogfood.1';
 const ARMED = { plugin: 'warm-compact', key: 'armed' } as const;
 const DRAWN = { plugin: 'warm-compact', key: 'drawn' } as const;
 const LOG_KEY = 'log';
