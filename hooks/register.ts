@@ -141,7 +141,10 @@ async function lookDrawn($: EngineInterface) {
   await markDrawn($);
 }
 
-/** Marks the session drawn and keeps the mark in $.state; true when it was not drawn before. */
+/**
+ * Marks the session drawn and keeps the mark in $.state, with the last request
+ * seen while it was hidden; true when it was not drawn before.
+ */
 async function markDrawn($: EngineInterface) {
   if (drawn) return false;
   drawn = true;
@@ -149,6 +152,9 @@ async function markDrawn($: EngineInterface) {
   try {
     await $.state.set(DRAWN, { sessionId: await $.session.id() });
   } catch {}
+  // Requests seen while hidden were not kept. The last one is kept now, as ended only
+  // where this module saw its turn end: one loaded mid-turn has no currentTurn.
+  if (lastRequestAt !== undefined) await keepRequest($, lastRequestAt, !working && currentTurn !== undefined);
   return true;
 }
 

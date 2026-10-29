@@ -1055,6 +1055,38 @@ test('a turn begun before a reload, ended while hidden: a client joining later a
   expect(stored(f).map(e => [e.outcome, e.reason])).toEqual([['noted', 'arm: no surface has drawn the session'], ['compacted', 'idle']]);
 });
 
+// A session hidden at its start keeps no request: the join keeps the last one it saw,
+// so a reload before the turn ends (the card's removal ends it) still arms at its end.
+test('a client joining a hidden session mid-turn keeps the request seen before it, its turn not ended', async ($, on) => {
+  const f = fixture(on, { surfaces: [] });
+  await $.session.start(DESKTOP);
+  await requestInTurn($);
+  expect(f.state.has('request')).toBe(false);
+  await f.clock.advance(10 * MIN);
+  await $.session.attach(JOIN);
+  expect(f.state.get('request')).toEqual({ sessionId: 'test-session', at: NOW, ended: false });
+});
+
+test('a client joining a hidden session after its turn ended keeps the request as ended, and arms as before', async ($, on) => {
+  const f = fixture(on, { surfaces: [] });
+  await $.session.start(DESKTOP);
+  await turn($, f.clock);
+  expect(f.state.has('request')).toBe(false);
+  await f.clock.advance(10 * MIN);
+  await $.session.attach(JOIN);
+  expect(f.state.get('request')).toEqual({ sessionId: 'test-session', at: NOW, ended: true });
+  expect(f.state.get('armed')).toEqual({ sessionId: 'test-session', lastRequestAt: NOW });
+});
+
+test('a client joining after a reload mid-turn keeps the request seen as not ended: the module never saw its turn start', async ($, on) => {
+  const f = fixture(on, { surfaces: [] });
+  await $.session.start(DESKTOP);
+  for await (const _ of $.turn.step({ turnId: 'running', index: 1, model: 'test', messageCount: 3 })) { /* drain */ }
+  await f.clock.advance(10 * MIN);
+  await $.session.attach(JOIN);
+  expect(f.state.get('request')).toEqual({ sessionId: 'test-session', at: NOW, ended: false });
+});
+
 test('status and now answer in Russian when configured', RU, async ($, on) => {
   const f = fixture(on);
   await $.session.start(DESKTOP);
