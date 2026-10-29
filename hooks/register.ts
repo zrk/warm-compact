@@ -554,9 +554,10 @@ async function catchUp($: EngineInterface) {
       if (!unwatched.has(id)) continue;
       const w = await watchCard($, id, questions, () => unwatched.has(id)).catch(() => undefined);
       if (!w) continue;
-      // Answered after the watch's last look: the watch must not keep it.
+      // Nothing is awaited between the watch's last look (`still`) and its keeping the
+      // card: one answered after that look is dropped by its own tool.call's finally.
+      // Gone from `unwatched` otherwise, it was claimed by another join's catch-up.
       if (unwatched.delete(id)) running.delete(id);
-      else dropCard(id);
     }
     return;
   }
@@ -564,7 +565,8 @@ async function catchUp($: EngineInterface) {
   // `timer` is the idle timer or the one /warm-compact now set: either owns the
   // session, as does a compaction under way or a turn.
   const idle = () => !working && lastRequestAt === since && timer === undefined && compacting === undefined;
-  if (since === undefined || !idle()) return;
+  // A request seen without its turn's start: the module loaded mid-turn, and the turn may run still.
+  if (since === undefined || currentTurn === undefined || !idle()) return;
   // Past the cutoff the cache is cold: the timer would only skip the session as late.
   const now = await $.clock.now();
   // Looked at again after the read: a turn may have started meanwhile. Nothing is
@@ -764,6 +766,7 @@ export const register: Register = (on, options) => {
       turnWatch?.cancel();
       turnWatch = undefined;
     }
+    currentTurn ??= e.turnId;
     // A turn that started meanwhile owns the state now.
     if (armed !== generation) {
       // Unless no turn started: then nothing will arm the timer, and a turn seems to run on.
