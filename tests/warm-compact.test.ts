@@ -1764,6 +1764,60 @@ test('a vetoed /compact keeps the question for the next compaction, and one that
   expect(f.compactions[1]).not.toContain(QUESTION.question);
 });
 
+test('a compaction skipped for a limit used up after the removal keeps the question for the next one, and one that compacted with it drops it', async ($, on) => {
+  const f = fixture(on);
+  await $.session.start(DESKTOP);
+  const { turnId } = await askInTurn($, f);
+  // The limit was free when the card was removed, and is used up by the time the timer fires.
+  f.world.onAbort = () => { f.world.rateLimits = [{ kind: 'five_hour', percentUsed: 100, resetsAt: iso(NOW + 2 * HOUR) }]; };
+  await f.clock.advance(52 * MIN);
+  expect(f.aborts).toEqual([turnId]);
+  await ended($, turnId, 'aborted');
+  await f.clock.settle();
+  expect(stored(f).map(e => [e.outcome, e.reason])).toEqual([['skipped', 'limited']]);
+  expect(f.commands).toEqual([]);
+  // After the reset, by hand: the summary still gets the question.
+  await f.clock.advance(70 * MIN);
+  await command($, 'now');
+  await f.clock.advance(1000);
+  await compactTurn($, f);
+  expect(f.compactions.length).toBe(1);
+  expect(f.compactions[0]).toContain(FULL);
+  // Compacted with it: the next one does not repeat it.
+  await command($, 'now');
+  await f.clock.advance(1000);
+  await compactTurn($, f);
+  expect(f.compactions.length).toBe(2);
+  expect(f.compactions[1]).not.toContain(QUESTION.question);
+});
+
+test('a failed compaction keeps the question for the next one, and one that compacted with it drops it', async ($, on) => {
+  const f = fixture(on);
+  await $.session.start(DESKTOP);
+  const { turnId } = await askInTurn($, f);
+  await f.clock.advance(52 * MIN);
+  await ended($, turnId, 'aborted');
+  await f.clock.settle();
+  // The queued /compact ends without a compaction.
+  expect(f.commands.length).toBe(1);
+  f.world.release?.();
+  await f.clock.settle();
+  expect(stored(f).map(e => e.outcome)).toEqual(['failed']);
+  expect(f.compactions).toEqual([]);
+  // By hand: the summary still gets the question.
+  await command($, 'now');
+  await f.clock.advance(1000);
+  await compactTurn($, f);
+  expect(f.compactions.length).toBe(1);
+  expect(f.compactions[0]).toContain(FULL);
+  // Compacted with it: the next one does not repeat it.
+  await command($, 'now');
+  await f.clock.advance(1000);
+  await compactTurn($, f);
+  expect(f.compactions.length).toBe(2);
+  expect(f.compactions[1]).not.toContain(QUESTION.question);
+});
+
 test('a model request drops the question: the conversation moved on', async ($, on) => {
   const f = fixture(on);
   await $.session.start(DESKTOP);
