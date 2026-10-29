@@ -1107,7 +1107,7 @@ test('the desktop text command is answered locally', async ($, on) => {
   on('prompt.submit', ($, e) => ({ text: e.text }));
   await $.session.start(DESKTOP);
   const reply = await $.prompt.submit({ text: '/warm-compact status', origin: { kind: 'composer' } } as never);
-  expect((reply as { drop?: string }).drop).toContain('warm-compact 0.2.7-dogfood.1');
+  expect((reply as { drop?: string }).drop).toContain('warm-compact 0.2.7-dogfood.2');
 });
 
 test('a turn of the person before the queued /compact skips it and arms again', async ($, on) => {
