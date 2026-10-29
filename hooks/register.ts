@@ -7,15 +7,20 @@ import { cachePercent, clockTime, instructions, questionLine, questionNote, sett
 // mod compacts it while the cache is still warm, so the summary reads the
 // conversation at the cache price and the next return starts small.
 
-const VERSION = '0.2.6-dogfood.2';
+const VERSION = '0.2.7';
 const ARMED = { plugin: 'warm-compact', key: 'armed' } as const;
 const DRAWN = { plugin: 'warm-compact', key: 'drawn' } as const;
+const REQUEST = { plugin: 'warm-compact', key: 'request' } as const;
 const LOG_KEY = 'log';
 const LOG_LIMIT = 500;
 const BUSY_AGENTS = ['pending', 'running', 'waiting'];
 // A compaction that has not reported back by then is given up on, so a call
 // that never settles cannot switch the mod off for the rest of the session.
 const STALE_MS = 10 * 60_000;
+// How far usage() may read under the last request before the two are told apart in the log.
+const GAP_TOKENS = 10_000;
+// A timer this late past its time is taken for lost, not for one slowed by a busy host.
+const LOST_MS = 2 * 60_000;
 
 // 'noted': a quiet exit that left the session without a timer, kept for diagnosis.
 type Outcome = 'compacted' | 'skipped' | 'failed' | 'noted';
@@ -85,12 +90,18 @@ let dueAt: number | undefined;
 // The request the armed timer counts from, as kept in $.state.
 let armedSince: number | undefined;
 let lastRequestAt: number | undefined;
+// What that request read, as the API reported it: told beside usage() when the two disagree.
+let lastRequestTokens: number | undefined;
 let working = false;
 let compacting: Compacting | undefined;
 // Whether a surface has listed this session at least once: a hidden session stays
 // armed, a headless run that never drew does not; quiet exits are kept for drawn sessions alone.
 // Kept in $.state too, so a reload while the session is hidden keeps it.
 let drawn = false;
+// Whether this module found the session's own mark in $.state at its start: a reload, not a first load.
+let reloaded = false;
+// A reload found a turn of the main loop under way: its end is due in this module.
+let awaitingEnd = false;
 // The quiet exits kept since the last armed timer: each is kept once.
 const quietKept = new Set<string>();
 // The main loop's turn that started last, and a watch on it that notes a turn not ending.
@@ -141,14 +152,38 @@ async function markDrawn($: EngineInterface) {
   return true;
 }
 
+/**
+ * Keeps the main loop's last request in $.state, and whether its turn ended:
+ * a reload that lands as the turn ends counts from it. Without `at` the saved
+ * one is kept as it is; a failed write costs only that reload.
+ */
+async function keepRequest($: EngineInterface, at: number | undefined, ended: boolean) {
+  try {
+    const sessionId = await $.session.id();
+    if (at === undefined) at = (await savedRequest($, sessionId))?.at;
+    if (at !== undefined) await $.state.set(REQUEST, { sessionId, at, ended });
+  } catch {}
+}
+
+async function savedRequest($: EngineInterface, sessionId: string) {
+  const { value } = await $.state.get(REQUEST);
+  return value && value.sessionId === sessionId ? value : undefined;
+}
+
+function forgetRequest($: EngineInterface) {
+  return $.state.set(REQUEST, null).catch(() => {});
+}
+
 async function isOff($: EngineInterface, sessionId: string) {
   return (await $.store.get(`off:${sessionId}`)) === true;
 }
 
-function append($: EngineInterface, entry: LogEntry) {
+/** Appends to the log; `unless` reads the log first and keeps the entry out when it says so. */
+function append($: EngineInterface, entry: LogEntry, unless?: (log: LogEntry[]) => boolean) {
   const run = appending.then(async () => {
     const saved = await $.store.get(LOG_KEY);
     const log = Array.isArray(saved) ? (saved as LogEntry[]) : [];
+    if (unless?.(log)) return;
     await $.store.set(LOG_KEY, [...log, entry].slice(-LOG_LIMIT));
   });
   appending = run.catch(() => {});
@@ -166,11 +201,13 @@ async function record($: EngineInterface, entry: LogEntry, line: string) {
 /**
  * A quiet exit that leaves a drawn session without a timer where one was due:
  * kept in the log alone, without a line in the session, each once until a timer
- * is armed again. The expected exits (a small context, off, headless, no
- * request, a newer turn taking over) are not kept.
+ * is armed again, and not again while it is the session's last entry (a reload
+ * forgets what was kept). The expected exits (a small context, off, a newer
+ * turn taking over) are not kept. `always` keeps one of a session that never
+ * drew, which is otherwise left alone.
  */
-async function quiet($: EngineInterface, reason: string, extra: { sessionId?: string; tokensBefore?: number; manual?: boolean } = {}) {
-  if (!drawn) return;
+async function quiet($: EngineInterface, reason: string, extra: { sessionId?: string; tokensBefore?: number; manual?: boolean; always?: boolean } = {}) {
+  if (!drawn && !extra.always) return;
   let key: string | undefined;
   try {
     const id = extra.sessionId ?? (await $.session.id().catch(() => 'unknown'));
@@ -180,7 +217,11 @@ async function quiet($: EngineInterface, reason: string, extra: { sessionId?: st
     quietKept.add(key);
     const now = await $.clock.now();
     const idleMinutes = lastRequestAt === undefined ? 0 : Math.round((now - lastRequestAt) / 60_000);
-    await append($, entry({ sessionId: id, idleMinutes, manual: extra.manual ?? false, tokensBefore: extra.tokensBefore }, now, 'noted', reason));
+    const repeated = (log: LogEntry[]) => {
+      const last = [...log].reverse().find(e => e.sessionId === id);
+      return last?.outcome === 'noted' && last.reason === reason;
+    };
+    await append($, entry({ sessionId: id, idleMinutes, manual: extra.manual ?? false, tokensBefore: extra.tokensBefore }, now, 'noted', reason), repeated);
   } catch {
     if (key !== undefined) quietKept.delete(key);
   }
@@ -242,7 +283,11 @@ async function finish($: EngineInterface, c: Compacting, result: SessionCompactR
   if (compacting !== c) return;
   compacting = undefined;
   // The history was replaced or the attempt is over: nothing to wait out until the next request.
-  if (!c.overtaken) lastRequestAt = undefined;
+  if (!c.overtaken) {
+    lastRequestAt = undefined;
+    lastRequestTokens = undefined;
+    await forgetRequest($);
+  }
   const now = await $.clock.now();
   if (result && result.skip === undefined) {
     // The summary holds the open questions now.
@@ -304,7 +349,11 @@ async function fire($: EngineInterface, token: number, sessionId: string, since:
   const base = { sessionId, idleMinutes: Math.round((start - since) / 60_000), manual };
   // A skip ends this idle period; the state is cleared only while no newer timer owns it.
   const skip = async (reason: string, line: string, tokensBefore?: number) => {
-    if (token === generation) await forget($);
+    if (token === generation) {
+      await forget($);
+      // Nor does a reload arm again from the request: the skip stands until the next turn.
+      await forgetRequest($);
+    }
     await record($, entry({ ...base, tokensBefore }, start, 'skipped', reason), line);
   };
   if ((await $.session.id()) !== sessionId) {
@@ -357,6 +406,7 @@ async function fire($: EngineInterface, token: number, sessionId: string, since:
   armedSince = undefined;
   // Cleared before compacting: a reload meanwhile must not start a second one.
   await forget($);
+  await forgetRequest($);
   const ours = () => compacting === attempt;
   if (!ours() || token !== generation || working) {
     if (ours()) compacting = undefined;
@@ -391,6 +441,21 @@ async function fire($: EngineInterface, token: number, sessionId: string, since:
   } catch (err) {
     await finish($, attempt, undefined, String((err as Error)?.message ?? err));
   }
+}
+
+/**
+ * At the start of a turn: a timer still in the state well past its time did not
+ * run to its end, as one that did clears it. A reload that dropped the timer and
+ * did not arm it again leaves it so; kept even where this module never saw a
+ * surface. The note is not awaited: the log never holds up the turn.
+ */
+async function lostTimer($: EngineInterface) {
+  try {
+    const { value } = await $.state.get(ARMED);
+    if (!value || value.sessionId !== (await $.session.id())) return;
+    const due = value.lastRequestAt + cfg.idleMs;
+    if ((await $.clock.now()) - due > LOST_MS) void quiet($, `turn.start: the timer due at ${clockTime(due)} was still armed, it never fired or stopped early`, { sessionId: value.sessionId, always: true });
+  } catch {}
 }
 
 /** Notes a turn of the main loop still running after the idle time: the timer waits on its end. */
@@ -514,21 +579,38 @@ function schedule($: EngineInterface, sessionId: string, since: number, now: num
 async function arm($: EngineInterface) {
   disarm();
   const token = generation;
-  const since = lastRequestAt;
-  if (since === undefined) return;
+  let since = lastRequestAt;
+  const read = lastRequestTokens;
   // Headless runs (-p, an SDK script, a bot) draw nowhere: leave them alone. A
   // session that drew is armed while hidden too: the desktop app lists no surface
   // for a session moved off the screen, and that is where the user leaves it idle.
   await lookDrawn($);
-  if (!drawn) return;
   const sessionId = await $.session.id();
   if (await isOff($, sessionId)) return;
   const { context } = await $.session.usage();
   const now = await $.clock.now();
   if (token !== generation) return;
-  if ((context.tokens ?? 0) < cfg.minTokens) {
+  const size = context.tokens ?? 0;
+  if (size < cfg.minTokens) {
     await forget($);
+    // The context reads small while the last request read a large one: the timer was due.
+    if (read !== undefined && read >= cfg.minTokens && read - size >= GAP_TOKENS) await quiet($, `arm: the context reads ${size} tokens, the last request read ${read}`, { sessionId, tokensBefore: read, always: true });
     return;
+  }
+  // From here a timer was due: each exit is kept, a headless run's too, as it may be a hidden session taken for one.
+  if (!drawn) {
+    await quiet($, 'arm: no surface has drawn the session', { sessionId, tokensBefore: size, always: true });
+    return;
+  }
+  if (since === undefined) {
+    // A reload landed in the turn: its requests were seen by the module before.
+    since = (await savedRequest($, sessionId).catch(() => undefined))?.at;
+    if (token !== generation) return;
+    if (since === undefined) {
+      await quiet($, 'arm: no request of the main loop seen since the module loaded', { sessionId, tokensBefore: size });
+      return;
+    }
+    lastRequestAt = since;
   }
   schedule($, sessionId, since, now);
   // Kept for a reload of the module, which drops its timers.
@@ -591,7 +673,36 @@ async function rearm($: EngineInterface) {
   const { value } = await $.state.get(ARMED);
   const sessionId = await $.session.id();
   const now = await $.clock.now();
-  if (token !== generation || !value || value.sessionId !== sessionId) return;
+  if (token !== generation) return;
+  if (!value || value.sessionId !== sessionId) {
+    // A reload with no timer in the state: a turn that ended as the module was
+    // swapped may not have kept it. Its last request still counts.
+    if (!reloaded || working || (await isOff($, sessionId))) return;
+    const saved = await savedRequest($, sessionId);
+    if (token !== generation) return;
+    // A turn under way: its end arms, in this module.
+    if (saved && !saved.ended) {
+      awaitingEnd = true;
+      return;
+    }
+    const { context } = await $.session.usage();
+    if (token !== generation || (context.tokens ?? 0) < cfg.minTokens) return;
+    if (!saved) {
+      await quiet($, 'session.start: a reload found no timer to pick up for a large context', { sessionId, tokensBefore: context.tokens });
+      return;
+    }
+    // Past the cutoff the cache is cold already: nothing to arm for.
+    if (now - saved.at > cfg.cutoffMs) return;
+    lastRequestAt = saved.at;
+    schedule($, sessionId, saved.at, now);
+    await $.state.set(ARMED, { sessionId, lastRequestAt: saved.at }).catch(() => {});
+    // Overtaken while writing: leave what a newer timer owns, as arm does.
+    if (token !== generation) {
+      if (armedSince === undefined) await forget($);
+      else await $.state.set(ARMED, { sessionId, lastRequestAt: armedSince }).catch(() => {});
+    }
+    return;
+  }
   if (await isOff($, sessionId)) return;
   if (token !== generation) return;
   lastRequestAt = value.lastRequestAt;
@@ -644,7 +755,8 @@ async function control($: EngineInterface, raw: string): Promise<{ text: string 
   }
   if (args === 'on') {
     await $.store.delete(`off:${sessionId}`);
-    if (!working && !compacting) await arm($);
+    // With no request yet there is nothing to count from: the next turn arms.
+    if (!working && !compacting && lastRequestAt !== undefined) await arm($);
     return { text: say('turnedOn') };
   }
   if (args === 'now') {
@@ -676,11 +788,12 @@ export const register: Register = (on, options) => {
     // A reload forgets the module's variables: whether the session draws is read
     // again, or taken from the mark a drawn session left before it was hidden.
     try {
+      const { value } = await $.state.get(DRAWN);
+      reloaded = !!value && value.sessionId === (await $.session.id());
+      if (reloaded) drawn = true;
+    } catch {}
+    try {
       await lookDrawn($);
-      if (!drawn) {
-        const { value } = await $.state.get(DRAWN);
-        if (value && value.sessionId === (await $.session.id())) drawn = true;
-      }
     } catch {}
     try {
       await $.command.register({ name: 'warm-compact', description: say('commandDescription'), argumentHint: 'status | now | off | on', immediate: true });
@@ -728,18 +841,28 @@ export const register: Register = (on, options) => {
   on('turn.step', async function* ($, e, next) {
     if (e.agentId === undefined) {
       const now = await $.clock.now().catch(() => undefined);
-      if (now !== undefined) lastRequestAt = now;
+      if (now !== undefined) {
+        lastRequestAt = now;
+        // A headless run is never armed after a reload: nothing to keep. Not
+        // awaited: the request to the model does not wait on the state.
+        if (drawn) void keepRequest($, now, false);
+      }
       // The main loop is busy again: a /compact still queued has nothing to do.
       if (compacting && !compacting.overtaken) compacting.overtaken = 'a turn ran first';
       // The conversation moved on, the questions with it: the user may have answered them.
       openQuestion = undefined;
     }
-    return yield* next(e);
+    const result = yield* next(e);
+    const u = result?.usage;
+    if (e.agentId === undefined && u) lastRequestTokens = u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens;
+    return result;
   });
 
   on('turn.start', async ($, e, next) => {
     if (e.agentId === undefined) {
       const unfinished = working;
+      // A timer or compaction of this module is alive, only late (a host that slept): not lost.
+      const live = timer !== undefined || compacting !== undefined;
       disarm();
       working = true;
       currentTurn = e.turnId;
@@ -747,7 +870,11 @@ export const register: Register = (on, options) => {
         watchTurn($, e.turnId);
       } catch {}
       if (unfinished) void quiet($, 'turn.start: the previous turn of the main loop did not end');
+      if (awaitingEnd) void quiet($, 'turn.start: the turn under way at the reload did not end in this module');
+      awaitingEnd = false;
+      if (!live) await lostTimer($);
       await forget($);
+      if (drawn) await keepRequest($, undefined, false);
     }
     return next(e);
   });
@@ -774,6 +901,10 @@ export const register: Register = (on, options) => {
       return result;
     }
     working = false;
+    awaitingEnd = false;
+    if (drawn) await keepRequest($, lastRequestAt, true);
+    // A turn that started while the end was kept owns the state now.
+    if (armed !== generation) return result;
     // Never let arming the timer break the turn.
     await arm($).catch(err => void quiet($, `arm or saving the timer failed: ${errorText(err)}`));
     return result;
@@ -820,7 +951,9 @@ export const register: Register = (on, options) => {
       if (compacting) compacting.overtaken = 'compacted by someone else first';
       disarm();
       lastRequestAt = undefined;
+      lastRequestTokens = undefined;
       await forget($);
+      await forgetRequest($);
     }
     return result;
   });
@@ -840,6 +973,10 @@ export const register: Register = (on, options) => {
     unwatched.clear();
     openQuestion = undefined;
     drawn = false;
+    reloaded = false;
+    awaitingEnd = false;
+    lastRequestTokens = undefined;
+    await forgetRequest($);
     quietKept.clear();
     await forget($);
     await $.state.set(DRAWN, null).catch(() => {});

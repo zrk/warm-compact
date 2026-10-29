@@ -1,6 +1,6 @@
 {
   "name": "warm-compact",
-  "version": "0.2.6-dogfood.2",
+  "version": "0.2.7",
   "description": "Compact a large idle session while its one-hour prompt cache is still warm",
   "author": { "name": "Ivan Balashov" },
   "license": "MIT",
